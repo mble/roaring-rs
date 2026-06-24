@@ -420,9 +420,17 @@ impl IntervalStore {
         array.iter().all(|&i| !self.contains(i))
     }
 
-    pub(crate) fn is_disjoint_bitmap(&self, array: &BitmapStore) -> bool {
-        // TODO: make this better
-        array.iter().all(|i| !self.contains(i))
+    pub(crate) fn is_disjoint_bitmap(&self, bits: &BitmapStore) -> bool {
+        // For each interval, check whether *any* of the bitmap's words covering
+        // that interval has a set bit inside it. This avoids walking every set bit
+        // in the bitmap and binary-searching the runs (~card × log R operations);
+        // instead it does at most ~total run length / 64 word-loads.
+        for iv in self.intervals.iter() {
+            if bits.intersection_len_interval(iv) != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn is_subset(&self, other: &Self) -> bool {
