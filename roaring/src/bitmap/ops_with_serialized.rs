@@ -136,7 +136,12 @@ impl RoaringBitmap {
                             *len = u16::from_le(*len);
                         });
 
-                        let cardinality = intervals.iter().map(|[_, len]| *len as usize).sum();
+                        // The on-disk `len` field encodes `end - start`, so the actual
+                        // cardinality of each run is `len + 1`. The old expression was
+                        // short by `runs`, which could mis-size the inserted store and
+                        // force an immediate Array->Bitmap promotion right at the
+                        // ARRAY_LIMIT boundary.
+                        let cardinality = intervals.iter().map(|[_, len]| *len as usize + 1).sum();
                         let mut store = Store::with_capacity(cardinality);
                         intervals.into_iter().try_for_each(
                             |[s, len]| -> Result<(), io::ErrorKind> {
