@@ -194,8 +194,11 @@ impl ArrayStore {
     }
 
     pub fn remove_smallest(&mut self, n: u64) {
-        self.vec.rotate_left(n as usize);
-        self.vec.truncate(self.vec.len() - n as usize);
+        // `drain(..n)` shifts the tail of the vec left exactly once. The previous
+        // `rotate_left(n) + truncate` rotated the whole vec in place and then
+        // truncated, paying an extra `n` element copies for the saved-then-restored
+        // head that immediately got dropped. Same final state, fewer moves.
+        self.vec.drain(..n as usize);
     }
 
     pub fn remove_biggest(&mut self, n: u64) {
