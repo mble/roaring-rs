@@ -24,3 +24,7 @@ simd = ["roaring/simd"]
 [[bench]]
 name = "lib"
 harness = false
+
+[[bench]]
+name = "view_benches"
+harness = false
