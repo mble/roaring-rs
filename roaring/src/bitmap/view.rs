@@ -24,6 +24,10 @@ use crate::RoaringBitmap;
 pub struct RoaringBitmapView<'a> {
     bytes: &'a [u8],
     containers: Vec<ContainerEntry>,
+    /// Prefix sums of container cardinalities. `prefix_cardinalities[i]` is the
+    /// total number of values in containers `0..i`, so the final entry equals
+    /// `len`. Used for O(1) `rank` cross-container lookups.
+    prefix_cardinalities: Vec<u64>,
     len: u64,
 }
 
@@ -149,6 +153,8 @@ impl<'a> RoaringBitmapView<'a> {
         let payloads_offset = offset;
         let mut payload_offset = payloads_offset;
         let mut containers = Vec::with_capacity(size);
+        let mut prefix_cardinalities = Vec::with_capacity(size + 1);
+        prefix_cardinalities.push(0);
         let mut total_len = 0u64;
         let mut last_key = None;
 
@@ -218,6 +224,7 @@ impl<'a> RoaringBitmapView<'a> {
             )?;
 
             total_len += u64::from(cardinality);
+            prefix_cardinalities.push(total_len);
             containers.push(ContainerEntry {
                 key,
                 cardinality,
@@ -226,7 +233,7 @@ impl<'a> RoaringBitmapView<'a> {
             });
         }
 
-        Ok(Self { bytes, containers, len: total_len })
+        Ok(Self { bytes, containers, prefix_cardinalities, len: total_len })
     }
 
     /// Returns the number of values in the bitmap.
@@ -265,17 +272,9 @@ impl<'a> RoaringBitmapView<'a> {
         let (key, index) = util::split(value);
         match self.containers.binary_search_by_key(&key, |container| container.key) {
             Ok(pos) => {
-                self.containers[pos].rank(self.bytes, index)
-                    + self.containers[..pos]
-                        .iter()
-                        .rev()
-                        .map(|container| u64::from(container.cardinality))
-                        .sum::<u64>()
+                self.containers[pos].rank(self.bytes, index) + self.prefix_cardinalities[pos]
             }
-            Err(pos) => self.containers[..pos]
-                .iter()
-                .map(|container| u64::from(container.cardinality))
-                .sum(),
+            Err(pos) => self.prefix_cardinalities[pos],
         }
     }
 
@@ -378,7 +377,7 @@ impl ContainerEntry {
         ViewContainerIter { key: self.key, inner }
     }
 
-    fn to_store(&self, bytes: &[u8]) -> Store {
+    fn to_store(self, bytes: &[u8]) -> Store {
         match self.kind {
             ContainerKind::Array => {
                 let payload = self.array_payload(bytes);
@@ -390,8 +389,21 @@ impl ContainerEntry {
             ContainerKind::Bitmap => {
                 let payload = self.bitmap_payload(bytes);
                 let mut bits = Box::new([0u64; BITMAP_LENGTH]);
-                for (index, word) in bits.iter_mut().enumerate() {
-                    *word = read_u64_at(payload, index * 8);
+                debug_assert_eq!(payload.len(), BITMAP_BYTES);
+                // SAFETY: validate_bitmap has ensured payload.len() == BITMAP_BYTES, which
+                // equals size_of::<[u64; BITMAP_LENGTH]>(). The destination is a freshly
+                // allocated Box so the regions cannot overlap. A &mut [u64] is always at
+                // least 8-byte aligned, satisfying the alignment requirement on its u8 view.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        bits.as_mut_ptr().cast::<u8>(),
+                        BITMAP_BYTES,
+                    );
+                }
+                #[cfg(target_endian = "big")]
+                for word in bits.iter_mut() {
+                    *word = word.swap_bytes();
                 }
                 Store::Bitmap(BitmapStore::from_unchecked(u64::from(self.cardinality), bits))
             }
@@ -593,8 +605,11 @@ fn validate_array(bytes: &[u8], offset: usize, cardinality: u32) -> Result<(), P
 
 fn validate_bitmap(bytes: &[u8], offset: usize, cardinality: u32) -> Result<(), ParseError> {
     checked_payload(bytes, offset, BITMAP_BYTES)?;
-    let actual = (0..BITMAP_LENGTH)
-        .map(|index| read_u64_at(bytes, offset + index * 8).count_ones())
+    // count_ones is endian-invariant, so from_ne_bytes (free on all targets) is
+    // sufficient. chunks_exact lets LLVM hoist the slice bounds invariant.
+    let actual = bytes[offset..offset + BITMAP_BYTES]
+        .chunks_exact(8)
+        .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()).count_ones())
         .sum::<u32>();
     if actual == cardinality {
         Ok(())
