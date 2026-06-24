@@ -1,8 +1,14 @@
 //! Performance guardrails for `RoaringBitmapView`.
 //!
-//! Three Criterion groups exercise the parse, rank, and to_owned paths against
-//! deterministic synthetic fixtures (no dataset download required, so this
-//! bench also runs under `cargo test -p benchmarks --benches` in CI).
+//! Three Criterion groups (`view_to_owned`, `view_rank`, `view_parse`) measure
+//! the hot paths against two complementary fixture sources:
+//!
+//! - **Synthetic** (`*/synthetic/*`): deterministic fixtures with no network
+//!   dependency, so the bench also runs under `cargo test -p benchmarks
+//!   --benches` in CI without needing the dataset clone.
+//! - **Real** (`*/<dataset>`): the `real-roaring-datasets` corpus shared with
+//!   `benches/lib.rs`, providing workload-representative cardinality
+//!   distributions.
 //!
 //! Local regression check (run on base, switch branches, run on PR):
 //! ```
@@ -11,12 +17,16 @@
 //! cargo bench --bench view_benches -- --baseline pre
 //! ```
 //! Criterion prints the percentage delta per benchmark. The audit set a 10%
-//! regression budget for `view_to_owned/dense_bitmap`, `view_rank/*`, and
-//! `view_parse/bitmap_heavy` specifically.
+//! regression budget for `view_to_owned/synthetic/dense_bitmap`,
+//! `view_rank/synthetic/*`, and `view_parse/synthetic/bitmap_heavy`.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use roaring::{RoaringBitmap, RoaringBitmapView};
+
+use crate::datasets::Datasets;
+
+mod datasets;
 
 const CONTAINER_BASE: u32 = 1 << 16;
 
@@ -101,9 +111,15 @@ fn view_to_owned(c: &mut Criterion) {
     let array_view = RoaringBitmapView::try_new(&array_bytes).unwrap();
     let run_view = RoaringBitmapView::try_new(&run_bytes).unwrap();
 
-    group.bench_function("dense_bitmap", |b| b.iter(|| black_box(dense_view.to_owned())));
-    group.bench_function("sparse_array", |b| b.iter(|| black_box(array_view.to_owned())));
-    group.bench_function("runs", |b| b.iter(|| black_box(run_view.to_owned())));
+    group.bench_function(BenchmarkId::new("synthetic", "dense_bitmap"), |b| {
+        b.iter(|| black_box(dense_view.to_owned()))
+    });
+    group.bench_function(BenchmarkId::new("synthetic", "sparse_array"), |b| {
+        b.iter(|| black_box(array_view.to_owned()))
+    });
+    group.bench_function(BenchmarkId::new("synthetic", "runs"), |b| {
+        b.iter(|| black_box(run_view.to_owned()))
+    });
 
     group.finish();
 }
@@ -122,7 +138,7 @@ fn view_rank(c: &mut Criterion) {
         let stride = (max / 1024).max(1);
         let probes: Vec<u32> = (0..1024u32).map(|i| i.saturating_mul(stride)).collect();
 
-        let id = BenchmarkId::from_parameter(format!("{num_containers}_containers"));
+        let id = BenchmarkId::new("synthetic", format!("{num_containers}_containers"));
         group.bench_function(id, |b| {
             b.iter(|| {
                 for &probe in &probes {
@@ -142,18 +158,110 @@ fn view_parse(c: &mut Criterion) {
     let array_bytes = serialize(&build_array_heavy(64));
     let run_bytes = serialize(&build_run_heavy(64));
 
-    group.bench_function("bitmap_heavy", |b| {
+    group.bench_function(BenchmarkId::new("synthetic", "bitmap_heavy"), |b| {
         b.iter(|| black_box(RoaringBitmapView::try_new(&dense_bytes).unwrap()));
     });
-    group.bench_function("array_heavy", |b| {
+    group.bench_function(BenchmarkId::new("synthetic", "array_heavy"), |b| {
         b.iter(|| black_box(RoaringBitmapView::try_new(&array_bytes).unwrap()));
     });
-    group.bench_function("run_heavy", |b| {
+    group.bench_function(BenchmarkId::new("synthetic", "run_heavy"), |b| {
         b.iter(|| black_box(RoaringBitmapView::try_new(&run_bytes).unwrap()));
     });
 
     group.finish();
 }
 
-criterion_group!(view_benches, view_to_owned, view_rank, view_parse);
+/// Serialize every bitmap in a dataset into a vec of bytes (one per bitmap).
+fn dataset_bytes(dataset: &datasets::Dataset) -> Vec<Vec<u8>> {
+    dataset
+        .bitmaps
+        .iter()
+        .map(|bitmap| {
+            let mut buf = Vec::with_capacity(bitmap.serialized_size());
+            bitmap.serialize_into(&mut buf).unwrap();
+            buf
+        })
+        .collect()
+}
+
+fn view_to_owned_real(c: &mut Criterion) {
+    let mut group = c.benchmark_group("view_to_owned");
+
+    for dataset in Datasets {
+        let inputs = dataset_bytes(dataset);
+        let views: Vec<RoaringBitmapView<'_>> =
+            inputs.iter().map(|buf| RoaringBitmapView::try_new(buf).unwrap()).collect();
+
+        group.throughput(Throughput::Elements(dataset.bitmaps.iter().map(|rb| rb.len()).sum()));
+        group.bench_function(BenchmarkId::new("to_owned", &dataset.name), |b| {
+            b.iter(|| {
+                for view in &views {
+                    black_box(view.to_owned());
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn view_rank_real(c: &mut Criterion) {
+    let mut group = c.benchmark_group("view_rank");
+
+    for dataset in Datasets {
+        let inputs = dataset_bytes(dataset);
+        let views: Vec<RoaringBitmapView<'_>> =
+            inputs.iter().map(|buf| RoaringBitmapView::try_new(buf).unwrap()).collect();
+
+        // Match lib.rs::rank — probe every 100th value below the cardinality.
+        // Capping probes at len() (rather than max()) avoids degenerating into
+        // a len() benchmark for any sparse bitmap.
+        let probes: Vec<Vec<u32>> = views
+            .iter()
+            .map(|view| (0..view.len() as u32).step_by(100).collect::<Vec<u32>>())
+            .collect();
+
+        group.throughput(Throughput::Elements(probes.iter().map(|p| p.len() as u64).sum()));
+        group.bench_function(BenchmarkId::new("rank", &dataset.name), |b| {
+            b.iter(|| {
+                for (view, probes) in views.iter().zip(probes.iter()) {
+                    for &probe in probes {
+                        black_box(view.rank(probe));
+                    }
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn view_parse_real(c: &mut Criterion) {
+    let mut group = c.benchmark_group("view_parse");
+
+    for dataset in Datasets {
+        let inputs = dataset_bytes(dataset);
+
+        group.throughput(Throughput::Bytes(inputs.iter().map(|b| b.len() as u64).sum()));
+        group.bench_function(BenchmarkId::new("try_new", &dataset.name), |b| {
+            b.iter(|| {
+                for buf in &inputs {
+                    black_box(RoaringBitmapView::try_new(buf).unwrap());
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    view_benches,
+    view_to_owned,
+    view_rank,
+    view_parse,
+    view_to_owned_real,
+    view_rank_real,
+    view_parse_real,
+);
 criterion_main!(view_benches);
