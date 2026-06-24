@@ -278,6 +278,51 @@ impl<'a> RoaringBitmapView<'a> {
         }
     }
 
+    /// Computes the len of the intersection with another view without materializing a bitmap.
+    pub fn intersection_len(&self, other: &Self) -> u64 {
+        let mut lhs = 0;
+        let mut rhs = 0;
+        let mut total = 0;
+
+        while let (Some(left), Some(right)) = (self.containers.get(lhs), other.containers.get(rhs))
+        {
+            match left.key.cmp(&right.key) {
+                Ordering::Less => lhs += 1,
+                Ordering::Greater => rhs += 1,
+                Ordering::Equal => {
+                    total += left.intersection_len(self.bytes, right, other.bytes);
+                    lhs += 1;
+                    rhs += 1;
+                }
+            }
+        }
+
+        total
+    }
+
+    /// Computes the len of the union with another view without materializing a bitmap.
+    pub fn union_len(&self, other: &Self) -> u64 {
+        self.len() + other.len() - self.intersection_len(other)
+    }
+
+    /// Computes the len of the difference with another view without materializing a bitmap.
+    pub fn difference_len(&self, other: &Self) -> u64 {
+        self.len() - self.intersection_len(other)
+    }
+
+    /// Computes the len of the symmetric difference with another view without materializing a
+    /// bitmap.
+    pub fn symmetric_difference_len(&self, other: &Self) -> u64 {
+        let intersection_len = self.intersection_len(other);
+        self.len() + other.len() - intersection_len - intersection_len
+    }
+
+    /// Computes the len of the symmetric difference with another view without materializing a
+    /// bitmap.
+    pub fn xor_len(&self, other: &Self) -> u64 {
+        self.symmetric_difference_len(other)
+    }
+
     /// Iterates over all values in ascending order.
     pub fn iter(&self) -> RoaringBitmapViewIter<'_, 'a> {
         RoaringBitmapViewIter { view: self, container_index: 0, inner: None, remaining: self.len }
@@ -351,6 +396,55 @@ impl ContainerEntry {
             ContainerKind::Array => array_rank(self.array_payload(bytes), index),
             ContainerKind::Bitmap => bitmap_rank(self.bitmap_payload(bytes), index),
             ContainerKind::Run { runs } => run_rank(self.run_payload(bytes, runs), runs, index),
+        }
+    }
+
+    fn intersection_len(&self, bytes: &[u8], other: &Self, other_bytes: &[u8]) -> u64 {
+        match (self.kind, other.kind) {
+            (ContainerKind::Array, ContainerKind::Array) => array_intersection_len_array(
+                self.array_payload(bytes),
+                other.array_payload(other_bytes),
+            ),
+            (ContainerKind::Array, ContainerKind::Bitmap) => array_intersection_len_bitmap(
+                self.array_payload(bytes),
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Bitmap, ContainerKind::Array) => array_intersection_len_bitmap(
+                other.array_payload(other_bytes),
+                self.bitmap_payload(bytes),
+            ),
+            (ContainerKind::Bitmap, ContainerKind::Bitmap) => bitmap_intersection_len_bitmap(
+                self.bitmap_payload(bytes),
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Run { runs }, ContainerKind::Run { runs: other_runs }) => {
+                run_intersection_len_run(
+                    self.run_payload(bytes, runs),
+                    runs,
+                    other.run_payload(other_bytes, other_runs),
+                    other_runs,
+                )
+            }
+            (ContainerKind::Run { runs }, ContainerKind::Array) => array_intersection_len_run(
+                other.array_payload(other_bytes),
+                self.run_payload(bytes, runs),
+                runs,
+            ),
+            (ContainerKind::Array, ContainerKind::Run { runs }) => array_intersection_len_run(
+                self.array_payload(bytes),
+                other.run_payload(other_bytes, runs),
+                runs,
+            ),
+            (ContainerKind::Run { runs }, ContainerKind::Bitmap) => run_intersection_len_bitmap(
+                self.run_payload(bytes, runs),
+                runs,
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Bitmap, ContainerKind::Run { runs }) => run_intersection_len_bitmap(
+                other.run_payload(other_bytes, runs),
+                runs,
+                self.bitmap_payload(bytes),
+            ),
         }
     }
 
@@ -691,6 +785,40 @@ fn array_binary_search(payload: &[u8], index: u16) -> Result<usize, usize> {
     Err(left)
 }
 
+fn array_intersection_len_array(left: &[u8], right: &[u8]) -> u64 {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let left_len = left.len() / 2;
+    let right_len = right.len() / 2;
+    let mut total = 0;
+
+    while left_index < left_len && right_index < right_len {
+        let left_value = read_u16_at(left, left_index * 2);
+        let right_value = read_u16_at(right, right_index * 2);
+        match left_value.cmp(&right_value) {
+            Ordering::Less => left_index += 1,
+            Ordering::Greater => right_index += 1,
+            Ordering::Equal => {
+                total += 1;
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    total
+}
+
+fn array_intersection_len_bitmap(array: &[u8], bitmap: &[u8]) -> u64 {
+    let len = array.len() / 2;
+    (0..len).map(|index| u64::from(bitmap_contains(bitmap, read_u16_at(array, index * 2)))).sum()
+}
+
+fn array_intersection_len_run(array: &[u8], run: &[u8], runs: u16) -> u64 {
+    let len = array.len() / 2;
+    (0..len).map(|index| u64::from(run_contains(run, runs, read_u16_at(array, index * 2)))).sum()
+}
+
 fn bitmap_contains(payload: &[u8], index: u16) -> bool {
     let word_index = usize::from(index / 64);
     let bit = index % 64;
@@ -731,6 +859,52 @@ fn bitmap_rank(payload: &[u8], index: u16) -> u64 {
     full_words + u64::from((read_u64_at(payload, word_index * 8) & mask).count_ones())
 }
 
+fn bitmap_intersection_len_bitmap(left: &[u8], right: &[u8]) -> u64 {
+    left[..BITMAP_BYTES]
+        .chunks_exact(8)
+        .zip(right[..BITMAP_BYTES].chunks_exact(8))
+        .map(|(l, r)| {
+            let l = u64::from_le_bytes(l.try_into().unwrap());
+            let r = u64::from_le_bytes(r.try_into().unwrap());
+            (l & r).count_ones() as u64
+        })
+        .sum()
+}
+
+fn bitmap_intersection_len_range(payload: &[u8], start: u16, end: u16) -> u64 {
+    let start_word = usize::from(start / 64);
+    let end_word = usize::from(end / 64);
+    let start_bit = start % 64;
+    let end_bit = end % 64;
+
+    if start_word == end_word {
+        let mask = range_mask(start_bit, end_bit);
+        return u64::from((read_u64_at(payload, start_word * 8) & mask).count_ones());
+    }
+
+    let first_mask = u64::MAX << start_bit;
+    let last_mask = if end_bit == 63 { u64::MAX } else { (1u64 << (end_bit + 1)) - 1 };
+    let mut total = u64::from((read_u64_at(payload, start_word * 8) & first_mask).count_ones());
+
+    // Same chunks_exact pattern as bitmap_rank for the middle stretch of full words.
+    if end_word > start_word + 1 {
+        let mid_start = (start_word + 1) * 8;
+        let mid_end = end_word * 8;
+        total += payload[mid_start..mid_end]
+            .chunks_exact(8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()).count_ones() as u64)
+            .sum::<u64>();
+    }
+
+    total + u64::from((read_u64_at(payload, end_word * 8) & last_mask).count_ones())
+}
+
+fn range_mask(start_bit: u16, end_bit: u16) -> u64 {
+    let start_mask = u64::MAX << start_bit;
+    let end_mask = if end_bit == 63 { u64::MAX } else { (1u64 << (end_bit + 1)) - 1 };
+    start_mask & end_mask
+}
+
 fn run_contains(payload: &[u8], runs: u16, index: u16) -> bool {
     run_search(payload, runs, index).is_ok()
 }
@@ -752,6 +926,50 @@ fn run_rank(payload: &[u8], runs: u16, index: u16) -> u64 {
         }
     }
     rank
+}
+
+fn run_intersection_len_run(left: &[u8], left_runs: u16, right: &[u8], right_runs: u16) -> u64 {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut total = 0;
+
+    while left_index < usize::from(left_runs) && right_index < usize::from(right_runs) {
+        let (left_start, left_end) = run_bounds(left, left_index);
+        let (right_start, right_end) = run_bounds(right, right_index);
+
+        let start = left_start.max(right_start);
+        let end = left_end.min(right_end);
+        if start <= end {
+            total += u64::from(end - start) + 1;
+        }
+
+        match left_end.cmp(&right_end) {
+            Ordering::Less => left_index += 1,
+            Ordering::Greater => right_index += 1,
+            Ordering::Equal => {
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    total
+}
+
+fn run_intersection_len_bitmap(run: &[u8], runs: u16, bitmap: &[u8]) -> u64 {
+    (0..usize::from(runs))
+        .map(|index| {
+            let (start, end) = run_bounds(run, index);
+            bitmap_intersection_len_range(bitmap, start, end)
+        })
+        .sum()
+}
+
+fn run_bounds(payload: &[u8], index: usize) -> (u16, u16) {
+    let offset = RUN_NUM_BYTES + index * RUN_ELEMENT_BYTES;
+    let start = read_u16_at(payload, offset);
+    let end = start + read_u16_at(payload, offset + 2);
+    (start, end)
 }
 
 fn run_search(payload: &[u8], runs: u16, index: u16) -> Result<usize, usize> {
@@ -787,6 +1005,19 @@ mod test {
         bytes
     }
 
+    fn assert_cardinality_ops(left: &RoaringBitmap, right: &RoaringBitmap) {
+        let left_bytes = view_bytes(left);
+        let right_bytes = view_bytes(right);
+        let left_view = RoaringBitmapView::try_new(&left_bytes).unwrap();
+        let right_view = RoaringBitmapView::try_new(&right_bytes).unwrap();
+
+        assert_eq!(left_view.intersection_len(&right_view), (left & right).len());
+        assert_eq!(left_view.union_len(&right_view), (left | right).len());
+        assert_eq!(left_view.difference_len(&right_view), (left - right).len());
+        assert_eq!(left_view.symmetric_difference_len(&right_view), (left ^ right).len());
+        assert_eq!(left_view.xor_len(&right_view), (left ^ right).len());
+    }
+
     #[test]
     fn reads_array_bitmap_and_run_containers() {
         let mut bitmap = RoaringBitmap::from_iter([1, 3, 7, 65_535, 70_000]);
@@ -811,6 +1042,36 @@ mod test {
     }
 
     #[test]
+    fn cardinality_ops_match_owned_bitmap_container_pairs() {
+        let array = RoaringBitmap::from_iter([1, 3, 7, 65, 4_095, 70_001, 70_003]);
+        let mut bitmap = RoaringBitmap::from_iter(2_000..7_500);
+        bitmap.insert_range(70_000..75_000);
+
+        let mut run = RoaringBitmap::new();
+        run.insert_range(3_000..8_000);
+        run.insert_range(70_002..70_010);
+        run.optimize();
+
+        let mut disjoint_key = RoaringBitmap::new();
+        disjoint_key.insert_range(200_000..205_000);
+
+        for (left, right) in [
+            (&array, &array),
+            (&array, &bitmap),
+            (&bitmap, &array),
+            (&bitmap, &bitmap),
+            (&array, &run),
+            (&run, &array),
+            (&bitmap, &run),
+            (&run, &bitmap),
+            (&run, &run),
+            (&run, &disjoint_key),
+        ] {
+            assert_cardinality_ops(left, right);
+        }
+    }
+
+    #[test]
     fn rejects_bad_cookie() {
         assert!(matches!(
             RoaringBitmapView::try_new(&[1, 2, 3, 4]),
@@ -830,15 +1091,23 @@ mod test {
         #[test]
         fn matches_owned_bitmap(
             values in btree_set(0u32..=300_000, 0usize..=20_000),
+            other_values in btree_set(0u32..=300_000, 0usize..=20_000),
             checks in vec(0u32..=300_000, 0usize..=256),
             optimize in any::<bool>(),
+            other_optimize in any::<bool>(),
         ) {
             let mut bitmap = RoaringBitmap::from_sorted_iter(values.iter().copied()).unwrap();
             if optimize {
                 bitmap.optimize();
             }
+            let mut other = RoaringBitmap::from_sorted_iter(other_values.iter().copied()).unwrap();
+            if other_optimize {
+                other.optimize();
+            }
             let bytes = view_bytes(&bitmap);
             let view = RoaringBitmapView::try_new(&bytes).unwrap();
+            let other_bytes = view_bytes(&other);
+            let other_view = RoaringBitmapView::try_new(&other_bytes).unwrap();
 
             prop_assert_eq!(view.len(), bitmap.len());
             prop_assert_eq!(view.is_empty(), bitmap.is_empty());
@@ -851,6 +1120,15 @@ mod test {
                 prop_assert_eq!(view.contains(value), bitmap.contains(value));
                 prop_assert_eq!(view.rank(value), bitmap.rank(value));
             }
+
+            prop_assert_eq!(view.intersection_len(&other_view), bitmap.intersection_len(&other));
+            prop_assert_eq!(view.union_len(&other_view), bitmap.union_len(&other));
+            prop_assert_eq!(view.difference_len(&other_view), bitmap.difference_len(&other));
+            prop_assert_eq!(
+                view.symmetric_difference_len(&other_view),
+                bitmap.symmetric_difference_len(&other)
+            );
+            prop_assert_eq!(view.xor_len(&other_view), bitmap.symmetric_difference_len(&other));
         }
     }
 }
