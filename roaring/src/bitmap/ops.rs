@@ -478,6 +478,53 @@ mod test {
     use core::convert::Infallible;
     use proptest::prelude::*;
 
+    // Regression coverage for the two-pointer Sub Run/Array paths in
+    // `Store::sub_assign`. Both directions are exercised here against the highest
+    // bit in a container so the `u16::MAX` boundary in the merge is hit.
+    #[test]
+    fn sub_run_minus_array_handles_u16_max_boundary() {
+        let mut run = RoaringBitmap::new();
+        run.insert_range(0xFFFF_0000..=u32::MAX);
+        run.optimize();
+        let array = RoaringBitmap::from_iter([u32::MAX]);
+        let result = &run - &array;
+
+        let mut expected = RoaringBitmap::new();
+        expected.insert_range(0xFFFF_0000..=u32::MAX - 1);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sub_array_minus_run_handles_u16_max_boundary() {
+        let array = RoaringBitmap::from_iter([0xFFFF_0000, 0xFFFF_FFFE, u32::MAX]);
+        let mut run = RoaringBitmap::new();
+        run.insert_range(0xFFFF_FFF0..=u32::MAX);
+        run.optimize();
+        let result = &array - &run;
+
+        let expected = RoaringBitmap::from_iter([0xFFFF_0000u32]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sub_run_minus_array_skips_intervals_with_no_overlap() {
+        // Multi-interval run; array elements only land in some intervals.
+        let mut run = RoaringBitmap::new();
+        run.insert_range(10..=20);
+        run.insert_range(100..=200);
+        run.insert_range(1000..=2000);
+        run.optimize();
+        let array = RoaringBitmap::from_iter([50, 150, 5000]);
+        let result = &run - &array;
+
+        let mut expected = RoaringBitmap::new();
+        expected.insert_range(10..=20);
+        expected.insert_range(100..=149);
+        expected.insert_range(151..=200);
+        expected.insert_range(1000..=2000);
+        assert_eq!(result, expected);
+    }
+
     // fast count tests
     proptest! {
         #[test]

@@ -684,13 +684,59 @@ impl SubAssign<&Store> for Store {
                 SubAssign::sub_assign(runs1, runs2);
             }
             (Run(runs), Array(array)) => {
-                array.iter().for_each(|&f| {
-                    runs.remove(f);
-                });
+                // Two-pointer merge. For each interval, walk the array elements
+                // falling inside it, emitting `[start, x-1]` fragments around each
+                // removed element. The single linear pass is O(A + R), versus
+                // O(A * R) for the previous per-element `runs.remove(f)` (each of
+                // which shifts the underlying `Vec<Interval>`).
+                let arr_slice = array.as_slice();
+                let mut new_intervals: Vec<Interval> =
+                    Vec::with_capacity(runs.run_amount() as usize);
+                let mut arr_idx = 0usize;
+                for iv in runs.iter_intervals() {
+                    let mut start = iv.start();
+                    let end = iv.end();
+                    // `interval_exhausted` flips to true once we've consumed the whole
+                    // interval (either by `start` advancing past `end`, or by removing
+                    // `u16::MAX` from an interval ending at `u16::MAX`).
+                    let mut interval_exhausted = false;
+                    while arr_idx < arr_slice.len() && arr_slice[arr_idx] < start {
+                        arr_idx += 1;
+                    }
+                    while arr_idx < arr_slice.len() && arr_slice[arr_idx] <= end {
+                        let x = arr_slice[arr_idx];
+                        if start < x {
+                            new_intervals.push(Interval::new_unchecked(start, x - 1));
+                        }
+                        arr_idx += 1;
+                        if x == u16::MAX {
+                            interval_exhausted = true;
+                            break;
+                        }
+                        start = x + 1;
+                        if start > end {
+                            interval_exhausted = true;
+                            break;
+                        }
+                    }
+                    if !interval_exhausted && start <= end {
+                        new_intervals.push(Interval::new_unchecked(start, end));
+                    }
+                }
+                *runs = IntervalStore::from_vec_unchecked(new_intervals);
             }
             (Array(array), Run(runs)) => {
-                runs.iter_intervals().for_each(|iv| {
-                    array.remove_range(iv.start()..=iv.end());
+                // Two-pointer merge using `retain`: advance the interval cursor past
+                // intervals strictly below the current array value, then drop any
+                // array value inside the current interval. O(A + R) vs the old
+                // per-interval `array.remove_range` which was O(R * A).
+                let intervals_slice = runs.iter_intervals().as_slice();
+                let mut iv_index = 0usize;
+                array.retain(|x| {
+                    while iv_index < intervals_slice.len() && intervals_slice[iv_index].end() < x {
+                        iv_index += 1;
+                    }
+                    !(iv_index < intervals_slice.len() && intervals_slice[iv_index].start() <= x)
                 });
             }
             (this @ Run(..), Bitmap(bitmap)) => {
