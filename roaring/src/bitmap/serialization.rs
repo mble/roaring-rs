@@ -4,7 +4,7 @@ use crate::bitmap::store::{
     RUN_NUM_BYTES,
 };
 use crate::RoaringBitmap;
-use bytemuck::cast_slice_mut;
+use bytemuck::{cast_slice, cast_slice_mut};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use core::convert::Infallible;
 use std::error::Error;
@@ -123,21 +123,21 @@ impl RoaringBitmap {
         for container in &self.containers {
             match container.store {
                 Store::Array(ref values) => {
-                    for &value in values.iter() {
-                        writer.write_u16::<LittleEndian>(value)?;
-                    }
+                    write_u16_slice(&mut writer, values.as_slice())?;
                 }
                 Store::Bitmap(ref bits) => {
-                    for &value in bits.as_array() {
-                        writer.write_u64::<LittleEndian>(value)?;
-                    }
+                    write_u64_slice(&mut writer, bits.as_array())?;
                 }
                 Store::Run(ref intervals) => {
                     writer.write_u16::<LittleEndian>(intervals.run_amount() as u16)?;
-                    for iv in intervals.iter_intervals() {
-                        writer.write_u16::<LittleEndian>(iv.start())?;
-                        writer.write_u16::<LittleEndian>(iv.end() - iv.start())?;
-                    }
+                    // Pack each interval as `(start, end - start)` u16 pairs in one buffer so
+                    // the underlying writer sees a single contiguous payload instead of one
+                    // call per u16.
+                    let pairs: Vec<[u16; 2]> = intervals
+                        .iter_intervals()
+                        .map(|iv| [iv.start(), iv.end() - iv.start()])
+                        .collect();
+                    write_u16_slice(&mut writer, bytemuck::cast_slice::<[u16; 2], u16>(&pairs))?;
                 }
             }
         }
@@ -316,6 +316,34 @@ impl RoaringBitmap {
         }
 
         Ok(RoaringBitmap { containers })
+    }
+}
+
+/// Write a slice of `u16` values in little-endian order using a single `write_all`
+/// when the host is little-endian (the in-memory bytes already match the on-disk
+/// layout), and falling back to the per-element path otherwise.
+#[inline]
+fn write_u16_slice<W: io::Write>(writer: &mut W, values: &[u16]) -> io::Result<()> {
+    if cfg!(target_endian = "little") {
+        writer.write_all(cast_slice::<u16, u8>(values))
+    } else {
+        for &value in values {
+            writer.write_u16::<LittleEndian>(value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Same as [`write_u16_slice`] but for `u64`.
+#[inline]
+fn write_u64_slice<W: io::Write>(writer: &mut W, values: &[u64]) -> io::Result<()> {
+    if cfg!(target_endian = "little") {
+        writer.write_all(cast_slice::<u64, u8>(values))
+    } else {
+        for &value in values {
+            writer.write_u64::<LittleEndian>(value)?;
+        }
+        Ok(())
     }
 }
 
