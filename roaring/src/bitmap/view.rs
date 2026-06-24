@@ -720,8 +720,13 @@ fn bitmap_max(payload: &[u8]) -> u16 {
 fn bitmap_rank(payload: &[u8], index: u16) -> u64 {
     let word_index = usize::from(index / 64);
     let bit = index % 64;
-    let full_words =
-        (0..word_index).map(|word| read_u64_at(payload, word * 8).count_ones() as u64).sum::<u64>();
+    // One up-front slice bounds-check + chunks_exact(8) gives LLVM the invariant it
+    // needs to autovectorize the popcount loop (PSADBW on x86_64, popcount lanes on
+    // AArch64). `u64::from_le_bytes` is a no-op on little-endian targets.
+    let full_words: u64 = payload[..word_index * 8]
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()).count_ones() as u64)
+        .sum();
     let mask = if bit == 63 { u64::MAX } else { (1u64 << (bit + 1)) - 1 };
     full_words + u64::from((read_u64_at(payload, word_index * 8) & mask).count_ones())
 }
