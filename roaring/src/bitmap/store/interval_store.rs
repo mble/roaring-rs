@@ -417,7 +417,23 @@ impl IntervalStore {
     }
 
     pub(crate) fn is_disjoint_array(&self, array: &ArrayStore) -> bool {
-        array.iter().all(|&i| !self.contains(i))
+        // Two-pointer merge: array is sorted/unique, intervals are sorted/disjoint.
+        // Advance the interval cursor past intervals strictly before the current
+        // array value; if the current interval covers that value, the sets overlap.
+        // O(A + R) instead of O(A * log R) from the per-element `self.contains(i)`.
+        let mut iv_index = 0usize;
+        for &i in array.iter() {
+            while iv_index < self.intervals.len() && self.intervals[iv_index].end < i {
+                iv_index += 1;
+            }
+            if iv_index == self.intervals.len() {
+                return true;
+            }
+            if self.intervals[iv_index].start <= i {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn is_disjoint_bitmap(&self, bits: &BitmapStore) -> bool {
@@ -434,7 +450,24 @@ impl IntervalStore {
     }
 
     pub fn is_subset(&self, other: &Self) -> bool {
-        self.intervals.iter().all(|interval| other.contains_range(interval.start..=interval.end))
+        // Two-pointer merge: walk our intervals, advancing the other-store cursor
+        // past intervals strictly before the current one. If the current other-
+        // interval covers our interval, accept; otherwise, fail.
+        // O(R_self + R_other) instead of O(R_self * log R_other) from the per-
+        // interval `other.contains_range` binary searches.
+        let mut j = 0usize;
+        for iv in self.intervals.iter() {
+            while j < other.intervals.len() && other.intervals[j].end < iv.end {
+                j += 1;
+            }
+            if j == other.intervals.len() {
+                return false;
+            }
+            if other.intervals[j].start > iv.start {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn is_subset_array(&self, other: &ArrayStore) -> bool {
@@ -464,7 +497,22 @@ impl IntervalStore {
     }
 
     pub(crate) fn intersection_len_array(&self, other: &ArrayStore) -> u64 {
-        other.iter().map(|&f| self.contains(f) as u64).sum()
+        // Two-pointer merge: array is sorted/unique, intervals are sorted/disjoint.
+        // O(A + R) instead of O(A * log R) from the per-element `self.contains(f)`.
+        let mut iv_index = 0usize;
+        let mut count = 0u64;
+        for &f in other.iter() {
+            while iv_index < self.intervals.len() && self.intervals[iv_index].end < f {
+                iv_index += 1;
+            }
+            if iv_index == self.intervals.len() {
+                break;
+            }
+            if self.intervals[iv_index].start <= f {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub fn len(&self) -> u64 {
