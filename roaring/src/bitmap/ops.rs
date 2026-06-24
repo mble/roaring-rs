@@ -54,7 +54,20 @@ impl RoaringBitmap {
     /// assert_eq!(rb1.union_len(&rb2), (rb1 | rb2).len());
     /// ```
     pub fn union_len(&self, other: &RoaringBitmap) -> u64 {
-        self.len().wrapping_add(other.len()).wrapping_sub(self.intersection_len(other))
+        // |A ∪ B| = Σ over container keys:
+        //   key only in A → |A_k|
+        //   key only in B → |B_k|
+        //   key in both   → |A_k| + |B_k| − |A_k ∩ B_k|
+        // Fold into a single Pairs walk so we never traverse either container vec twice.
+        Pairs::new(&self.containers, &other.containers)
+            .map(|pair| match pair {
+                (Some(lhs), None) | (None, Some(lhs)) => lhs.len(),
+                (Some(lhs), Some(rhs)) => {
+                    lhs.len().wrapping_add(rhs.len()).wrapping_sub(lhs.intersection_len(rhs))
+                }
+                (None, None) => 0,
+            })
+            .sum()
     }
 
     /// Computes the len of the difference with the specified other bitmap without creating a new
@@ -75,7 +88,15 @@ impl RoaringBitmap {
     /// assert_eq!(rb1.difference_len(&rb2), (rb1 - rb2).len());
     /// ```
     pub fn difference_len(&self, other: &RoaringBitmap) -> u64 {
-        self.len() - self.intersection_len(other)
+        // |A \ B| = Σ over containers in A: |A_k| − |A_k ∩ B_k|. Containers absent
+        // from A contribute zero; containers in B but not A also contribute zero.
+        Pairs::new(&self.containers, &other.containers)
+            .map(|pair| match pair {
+                (Some(lhs), None) => lhs.len(),
+                (Some(lhs), Some(rhs)) => lhs.len() - lhs.intersection_len(rhs),
+                (None, _) => 0,
+            })
+            .sum()
     }
 
     /// Computes the len of the symmetric difference with the specified other bitmap without
@@ -96,11 +117,22 @@ impl RoaringBitmap {
     /// assert_eq!(rb1.symmetric_difference_len(&rb2), (rb1 ^ rb2).len());
     /// ```
     pub fn symmetric_difference_len(&self, other: &RoaringBitmap) -> u64 {
-        let intersection_len = self.intersection_len(other);
-        self.len()
-            .wrapping_add(other.len())
-            .wrapping_sub(intersection_len)
-            .wrapping_sub(intersection_len)
+        // |A Δ B| = Σ over container keys:
+        //   key only in A or only in B → |A_k| or |B_k|
+        //   key in both                → |A_k| + |B_k| − 2·|A_k ∩ B_k|
+        Pairs::new(&self.containers, &other.containers)
+            .map(|pair| match pair {
+                (Some(lhs), None) | (None, Some(lhs)) => lhs.len(),
+                (Some(lhs), Some(rhs)) => {
+                    let intersection = lhs.intersection_len(rhs);
+                    lhs.len()
+                        .wrapping_add(rhs.len())
+                        .wrapping_sub(intersection)
+                        .wrapping_sub(intersection)
+                }
+                (None, None) => 0,
+            })
+            .sum()
     }
 }
 
