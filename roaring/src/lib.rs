@@ -30,7 +30,7 @@ pub mod bitmap;
 /// A compressed bitmap with u64 values.  Implemented as a `BTreeMap` of `RoaringBitmap`s.
 pub mod treemap;
 
-pub use bitmap::RoaringBitmap;
+pub use bitmap::{ParseError, RoaringBitmap, RoaringBitmapView, RoaringBitmapViewIter};
 pub use treemap::RoaringTreemap;
 
 /// An error type that is returned when a `try_push` in a bitmap did not succeed.

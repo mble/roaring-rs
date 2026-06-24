@@ -19,11 +19,13 @@ mod ops_with_serialized;
 mod serde;
 #[cfg(feature = "std")]
 mod serialization;
+mod view;
 
 use self::cmp::Pairs;
 pub use self::iter::IntoIter;
 pub use self::iter::Iter;
 pub use self::statistics::Statistics;
+pub use self::view::{ParseError, RoaringBitmapView, RoaringBitmapViewIter};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -48,3 +50,15 @@ use alloc::vec::Vec;
 pub struct RoaringBitmap {
     containers: Vec<container::Container>,
 }
+
+pub(crate) const SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
+pub(crate) const SERIAL_COOKIE: u16 = 12347;
+pub(crate) const NO_OFFSET_THRESHOLD: usize = 4;
+
+// Sizes of header structures
+#[cfg(feature = "std")]
+pub(crate) const COOKIE_BYTES: usize = 4;
+#[cfg(feature = "std")]
+pub(crate) const SIZE_BYTES: usize = 4;
+pub(crate) const DESCRIPTION_BYTES: usize = 4;
+pub(crate) const OFFSET_BYTES: usize = 4;

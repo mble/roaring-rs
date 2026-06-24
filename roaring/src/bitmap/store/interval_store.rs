@@ -40,7 +40,6 @@ impl IntervalStore {
         RUN_NUM_BYTES + (RUN_ELEMENT_BYTES * run_amount as usize)
     }
 
-    #[cfg(feature = "std")]
     pub fn from_vec_unchecked(vec: Vec<Interval>) -> Self {
         #[cfg(debug_assertions)]
         {

@@ -7,9 +7,7 @@ use std::mem;
 use std::ops::RangeInclusive;
 
 use crate::bitmap::container::Container;
-use crate::bitmap::serialization::{
-    NO_OFFSET_THRESHOLD, SERIAL_COOKIE, SERIAL_COOKIE_NO_RUNCONTAINER,
-};
+use crate::bitmap::{NO_OFFSET_THRESHOLD, SERIAL_COOKIE, SERIAL_COOKIE_NO_RUNCONTAINER};
 use crate::RoaringBitmap;
 
 use super::container::ARRAY_LIMIT;

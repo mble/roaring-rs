@@ -11,16 +11,10 @@ use std::error::Error;
 use std::io;
 
 use super::store::IntervalStore;
-
-pub(crate) const SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
-pub(crate) const SERIAL_COOKIE: u16 = 12347;
-pub(crate) const NO_OFFSET_THRESHOLD: usize = 4;
-
-// Sizes of header structures
-pub(crate) const COOKIE_BYTES: usize = 4;
-pub(crate) const SIZE_BYTES: usize = 4;
-pub(crate) const DESCRIPTION_BYTES: usize = 4;
-pub(crate) const OFFSET_BYTES: usize = 4;
+use super::{
+    COOKIE_BYTES, DESCRIPTION_BYTES, NO_OFFSET_THRESHOLD, OFFSET_BYTES, SERIAL_COOKIE,
+    SERIAL_COOKIE_NO_RUNCONTAINER, SIZE_BYTES,
+};
 
 impl RoaringBitmap {
     /// Return the size in bytes of the serialized output.
