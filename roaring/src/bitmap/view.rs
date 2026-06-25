@@ -627,6 +627,14 @@ impl ContainerEntry {
         }
     }
 
+    fn payload_bytes<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        match self.kind {
+            ContainerKind::Array => self.array_payload(bytes),
+            ContainerKind::Bitmap => self.bitmap_payload(bytes),
+            ContainerKind::Run { runs } => self.run_payload(bytes, runs),
+        }
+    }
+
     fn iter<'a>(&self, bytes: &'a [u8]) -> ViewContainerIter<'a> {
         let inner = match self.kind {
             ContainerKind::Array => ViewContainerValues::Array {
@@ -695,6 +703,39 @@ impl ContainerEntry {
         }
     }
 }
+
+impl PartialEq for RoaringBitmapView<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        if self.containers.len() != other.containers.len() {
+            return false;
+        }
+        // Fast path: when every container has the same key/cardinality/kind,
+        // each payload has a canonical byte layout and set equality reduces
+        // to byte equality of payloads. Both bytea inputs to PG `rb_equals`
+        // typically come from the same serializer with the same optimize()
+        // pass, so this path hits in the common case and reduces the whole
+        // comparison to one memcmp per container.
+        let same_layout = self.containers.iter().zip(&other.containers).all(|(left, right)| {
+            left.key == right.key
+                && left.cardinality == right.cardinality
+                && left.kind == right.kind
+        });
+        if same_layout {
+            return self.containers.iter().zip(&other.containers).all(|(left, right)| {
+                left.payload_bytes(self.bytes) == right.payload_bytes(other.bytes)
+            });
+        }
+        // Slow path: cross-source / cross-shape comparison falls back to set
+        // equality. With lengths already equal, `self.is_subset(other)` is iff
+        // set equality.
+        self.is_subset(other)
+    }
+}
+
+impl Eq for RoaringBitmapView<'_> {}
 
 impl Iterator for RoaringBitmapViewIter<'_, '_> {
     type Item = u32;
@@ -1523,6 +1564,7 @@ mod test {
         assert_eq!(right_view.is_subset(&left_view), right.is_subset(left));
         assert_eq!(left_view.intersects(&right_view), !left.is_disjoint(right));
         assert_eq!(right_view.intersects(&left_view), !right.is_disjoint(left));
+        assert_eq!(left_view == right_view, left == right);
     }
 
     #[test]
@@ -1577,6 +1619,35 @@ mod test {
             assert_cardinality_ops(left, right);
             assert_predicate_ops(left, right);
         }
+    }
+
+    #[test]
+    fn eq_is_set_equality_across_layouts() {
+        // Same set in two different on-disk shapes: Bitmap (4_500 contiguous
+        // values keeps it in BitmapStore) and Run (after optimize). PartialEq
+        // must report equal via the set-equality slow path; the byte-compare
+        // fast path is intentionally bypassed by the layout mismatch.
+        let canonical = RoaringBitmap::from_iter(2_000..6_500);
+        let mut runs = canonical.clone();
+        runs.optimize();
+
+        let canonical_bytes = view_bytes(&canonical);
+        let runs_bytes = view_bytes(&runs);
+        let canonical_view = RoaringBitmapView::try_new(&canonical_bytes).unwrap();
+        let runs_view = RoaringBitmapView::try_new(&runs_bytes).unwrap();
+
+        assert_ne!(canonical_bytes, runs_bytes); // sanity: the bytes really differ
+        assert_eq!(canonical_view, runs_view);
+
+        // Identical bytes hit the layout-match memcmp fast path.
+        let canonical_view_again = RoaringBitmapView::try_new(&canonical_bytes).unwrap();
+        assert_eq!(canonical_view, canonical_view_again);
+
+        // Length short-circuit: differ by a single element.
+        let smaller = RoaringBitmap::from_iter(2_001..6_500);
+        let smaller_bytes = view_bytes(&smaller);
+        let smaller_view = RoaringBitmapView::try_new(&smaller_bytes).unwrap();
+        assert_ne!(canonical_view, smaller_view);
     }
 
     #[test]
@@ -1642,6 +1713,7 @@ mod test {
             prop_assert_eq!(other_view.is_subset(&view), other.is_subset(&bitmap));
             prop_assert_eq!(view.intersects(&other_view), !bitmap.is_disjoint(&other));
             prop_assert_eq!(other_view.intersects(&view), !other.is_disjoint(&bitmap));
+            prop_assert_eq!(view == other_view, bitmap == other);
         }
     }
 }
