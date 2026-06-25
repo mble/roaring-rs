@@ -323,6 +323,88 @@ impl<'a> RoaringBitmapView<'a> {
         self.symmetric_difference_len(other)
     }
 
+    /// Returns `true` if every value in this view is also contained in `other`.
+    ///
+    /// Matches the set-equality semantics of [`RoaringBitmap::is_subset`]: a
+    /// `Bitmap`-shaped container is never reported as a subset of an
+    /// `Array`-shaped container, regardless of cardinality.
+    pub fn is_subset(&self, other: &Self) -> bool {
+        // Total-cardinality short-circuit: a subset can never have more values
+        // than its superset. Both lengths are cached on the view so this is one
+        // u64 compare with no payload reads.
+        if self.len > other.len {
+            return false;
+        }
+
+        let mut lhs = 0;
+        let mut rhs = 0;
+        while lhs < self.containers.len() {
+            let left = &self.containers[lhs];
+            let Some(right) = other.containers.get(rhs) else {
+                return false;
+            };
+            match left.key.cmp(&right.key) {
+                Ordering::Less => return false,
+                Ordering::Greater => rhs += 1,
+                Ordering::Equal => {
+                    // Per-container cardinality precheck. Eliminates Bitmap ⊆ Array
+                    // and Run ⊆ Array in the common canonical layout before any
+                    // payload bytes are touched.
+                    if left.cardinality > right.cardinality {
+                        return false;
+                    }
+                    if !left.is_subset(self.bytes, right, other.bytes) {
+                        return false;
+                    }
+                    lhs += 1;
+                    rhs += 1;
+                }
+            }
+        }
+        true
+    }
+
+    /// Returns `true` if this view and `other` share at least one value.
+    ///
+    /// Equivalent to `!`[`RoaringBitmap::is_disjoint`] but short-circuits on the
+    /// first overlapping element.
+    pub fn intersects(&self, other: &Self) -> bool {
+        let (Some(self_first), Some(self_last)) = (self.containers.first(), self.containers.last())
+        else {
+            return false;
+        };
+        let (Some(other_first), Some(other_last)) =
+            (other.containers.first(), other.containers.last())
+        else {
+            return false;
+        };
+        // Key-range disjoint precheck: two u16 compares against cached endpoints,
+        // no payload reads. Big win for queries against bitmaps with well-separated
+        // key spaces (e.g. user-id buckets that never collide).
+        if self_last.key < other_first.key || other_last.key < self_first.key {
+            return false;
+        }
+
+        let mut lhs = 0;
+        let mut rhs = 0;
+        while lhs < self.containers.len() && rhs < other.containers.len() {
+            let left = &self.containers[lhs];
+            let right = &other.containers[rhs];
+            match left.key.cmp(&right.key) {
+                Ordering::Less => lhs += 1,
+                Ordering::Greater => rhs += 1,
+                Ordering::Equal => {
+                    if left.intersects(self.bytes, right, other.bytes) {
+                        return true;
+                    }
+                    lhs += 1;
+                    rhs += 1;
+                }
+            }
+        }
+        false
+    }
+
     /// Iterates over all values in ascending order.
     pub fn iter(&self) -> RoaringBitmapViewIter<'_, 'a> {
         RoaringBitmapViewIter { view: self, container_index: 0, inner: None, remaining: self.len }
@@ -445,6 +527,103 @@ impl ContainerEntry {
                 runs,
                 self.bitmap_payload(bytes),
             ),
+        }
+    }
+
+    fn is_subset(&self, bytes: &[u8], other: &Self, other_bytes: &[u8]) -> bool {
+        match (self.kind, other.kind) {
+            (ContainerKind::Array, ContainerKind::Array) => array_is_subset_of_array(
+                self.array_payload(bytes),
+                other.array_payload(other_bytes),
+            ),
+            (ContainerKind::Array, ContainerKind::Bitmap) => array_is_subset_of_bitmap(
+                self.array_payload(bytes),
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Array, ContainerKind::Run { runs }) => array_is_subset_of_run(
+                self.array_payload(bytes),
+                other.run_payload(other_bytes, runs),
+                runs,
+            ),
+            // Mirror RoaringBitmap::is_subset: a Bitmap-shaped container is never
+            // a subset of an Array-shaped container, regardless of cardinality.
+            // Keeps view/owned semantics in lock-step so `view == view.to_owned()`.
+            (ContainerKind::Bitmap, ContainerKind::Array) => false,
+            (ContainerKind::Bitmap, ContainerKind::Bitmap) => bitmap_is_subset_of_bitmap(
+                self.bitmap_payload(bytes),
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Bitmap, ContainerKind::Run { runs }) => bitmap_is_subset_of_run(
+                self.bitmap_payload(bytes),
+                other.run_payload(other_bytes, runs),
+                runs,
+            ),
+            (ContainerKind::Run { runs }, ContainerKind::Array) => run_is_subset_of_array(
+                self.run_payload(bytes, runs),
+                runs,
+                other.array_payload(other_bytes),
+            ),
+            (ContainerKind::Run { runs }, ContainerKind::Bitmap) => run_is_subset_of_bitmap(
+                self.run_payload(bytes, runs),
+                runs,
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Run { runs: left_runs }, ContainerKind::Run { runs: right_runs }) => {
+                run_is_subset_of_run(
+                    self.run_payload(bytes, left_runs),
+                    left_runs,
+                    other.run_payload(other_bytes, right_runs),
+                    right_runs,
+                )
+            }
+        }
+    }
+
+    fn intersects(&self, bytes: &[u8], other: &Self, other_bytes: &[u8]) -> bool {
+        match (self.kind, other.kind) {
+            (ContainerKind::Array, ContainerKind::Array) => {
+                array_intersects_array(self.array_payload(bytes), other.array_payload(other_bytes))
+            }
+            (ContainerKind::Array, ContainerKind::Bitmap) => array_intersects_bitmap(
+                self.array_payload(bytes),
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Bitmap, ContainerKind::Array) => array_intersects_bitmap(
+                other.array_payload(other_bytes),
+                self.bitmap_payload(bytes),
+            ),
+            (ContainerKind::Bitmap, ContainerKind::Bitmap) => bitmap_intersects_bitmap(
+                self.bitmap_payload(bytes),
+                other.bitmap_payload(other_bytes),
+            ),
+            (ContainerKind::Array, ContainerKind::Run { runs }) => array_intersects_run(
+                self.array_payload(bytes),
+                other.run_payload(other_bytes, runs),
+                runs,
+            ),
+            (ContainerKind::Run { runs }, ContainerKind::Array) => array_intersects_run(
+                other.array_payload(other_bytes),
+                self.run_payload(bytes, runs),
+                runs,
+            ),
+            (ContainerKind::Bitmap, ContainerKind::Run { runs }) => bitmap_intersects_run(
+                self.bitmap_payload(bytes),
+                other.run_payload(other_bytes, runs),
+                runs,
+            ),
+            (ContainerKind::Run { runs }, ContainerKind::Bitmap) => bitmap_intersects_run(
+                other.bitmap_payload(other_bytes),
+                self.run_payload(bytes, runs),
+                runs,
+            ),
+            (ContainerKind::Run { runs: left_runs }, ContainerKind::Run { runs: right_runs }) => {
+                run_intersects_run(
+                    self.run_payload(bytes, left_runs),
+                    left_runs,
+                    other.run_payload(other_bytes, right_runs),
+                    right_runs,
+                )
+            }
         }
     }
 
@@ -965,6 +1144,322 @@ fn run_intersection_len_bitmap(run: &[u8], runs: u16, bitmap: &[u8]) -> u64 {
         .sum()
 }
 
+// ---------------------------------------------------------------------------
+// Predicate kernels: is_subset / intersects
+//
+// Naming mirrors the cardinality-kernel convention above. `is_subset_of`
+// kernels are asymmetric in argument order: left ⊆ right. `intersects`
+// kernels are symmetric; the dispatcher above passes the smaller container
+// first when symmetry helps the inner loop, but all kernels are correct for
+// either ordering.
+// ---------------------------------------------------------------------------
+
+fn array_is_subset_of_array(left: &[u8], right: &[u8]) -> bool {
+    let left_len = left.len() / 2;
+    let right_len = right.len() / 2;
+    let mut li = 0;
+    let mut ri = 0;
+    while li < left_len {
+        // Pigeonhole: not enough right values remain to cover all left values.
+        if right_len - ri < left_len - li {
+            return false;
+        }
+        let lv = read_u16_at(left, li * 2);
+        loop {
+            if ri == right_len {
+                return false;
+            }
+            match read_u16_at(right, ri * 2).cmp(&lv) {
+                Ordering::Less => ri += 1,
+                Ordering::Equal => {
+                    ri += 1;
+                    break;
+                }
+                Ordering::Greater => return false,
+            }
+        }
+        li += 1;
+    }
+    true
+}
+
+fn array_is_subset_of_bitmap(array: &[u8], bitmap: &[u8]) -> bool {
+    let len = array.len() / 2;
+    for index in 0..len {
+        if !bitmap_contains(bitmap, read_u16_at(array, index * 2)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn array_is_subset_of_run(array: &[u8], run: &[u8], runs: u16) -> bool {
+    let len = array.len() / 2;
+    let run_count = usize::from(runs);
+    let mut run_index = 0usize;
+    for index in 0..len {
+        let value = read_u16_at(array, index * 2);
+        // Monotone interval cursor: advance past runs strictly before `value`.
+        while run_index < run_count {
+            let (start, end) = run_bounds(run, run_index);
+            if value <= end {
+                if value < start {
+                    return false;
+                }
+                break;
+            }
+            run_index += 1;
+        }
+        if run_index == run_count {
+            return false;
+        }
+    }
+    true
+}
+
+fn bitmap_is_subset_of_bitmap(left: &[u8], right: &[u8]) -> bool {
+    // chunks_exact(8) gives LLVM the constant-length invariant needed to
+    // autovectorize the AND-NOT loop (AVX2: 4 u64s/iter; AVX-512: 8). `.all()`
+    // short-circuits at the iterator boundary.
+    left[..BITMAP_BYTES].chunks_exact(8).zip(right[..BITMAP_BYTES].chunks_exact(8)).all(|(l, r)| {
+        let l = u64::from_le_bytes(l.try_into().unwrap());
+        let r = u64::from_le_bytes(r.try_into().unwrap());
+        l & !r == 0
+    })
+}
+
+fn bitmap_is_subset_of_run(bitmap: &[u8], run: &[u8], runs: u16) -> bool {
+    // Walk the bitmap's set bits, advancing a monotone run cursor. Short-circuit
+    // on the first set bit that falls outside every run.
+    let run_count = usize::from(runs);
+    let mut run_index = 0usize;
+    for word_index in 0..BITMAP_LENGTH {
+        let mut word = read_u64_at(bitmap, word_index * 8);
+        while word != 0 {
+            let bit = word.trailing_zeros() as u16;
+            let value = (word_index as u16) * 64 + bit;
+            while run_index < run_count {
+                let (start, end) = run_bounds(run, run_index);
+                if value <= end {
+                    if value < start {
+                        return false;
+                    }
+                    break;
+                }
+                run_index += 1;
+            }
+            if run_index == run_count {
+                return false;
+            }
+            word &= word - 1;
+        }
+    }
+    true
+}
+
+fn run_is_subset_of_array(run: &[u8], runs: u16, array: &[u8]) -> bool {
+    // Algebraic trick: for run [s, e] of length L = e - s, binary-search `s` in
+    // the sorted-unique array. If `array[pos] == s` and `array[pos + L] == e`
+    // then array[pos..=pos+L] are L+1 distinct sorted u16 values in [s, e],
+    // which must be exactly s, s+1, ..., e (the interval is fully covered).
+    // Avoids touching the L-1 interior values entirely.
+    let array_len = array.len() / 2;
+    let run_count = usize::from(runs);
+    for run_index in 0..run_count {
+        let (start, end) = run_bounds(run, run_index);
+        let len = usize::from(end - start);
+        let pos = match array_binary_search(array, start) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if pos + len >= array_len {
+            return false;
+        }
+        if read_u16_at(array, (pos + len) * 2) != end {
+            return false;
+        }
+    }
+    true
+}
+
+fn run_is_subset_of_bitmap(run: &[u8], runs: u16, bitmap: &[u8]) -> bool {
+    let run_count = usize::from(runs);
+    for run_index in 0..run_count {
+        let (start, end) = run_bounds(run, run_index);
+        if !bitmap_contains_range(bitmap, start, end) {
+            return false;
+        }
+    }
+    true
+}
+
+fn run_is_subset_of_run(left: &[u8], left_runs: u16, right: &[u8], right_runs: u16) -> bool {
+    // Two-pointer interval merge: for each left run, advance the right cursor
+    // until the right run's end reaches or exceeds the left run's end. If the
+    // right run also starts at or before the left run's start, it covers; else
+    // not-subset. Mirrors `interval_store::is_subset`.
+    let left_count = usize::from(left_runs);
+    let right_count = usize::from(right_runs);
+    let mut ri = 0usize;
+    for li in 0..left_count {
+        let (ls, le) = run_bounds(left, li);
+        while ri < right_count && run_bounds(right, ri).1 < le {
+            ri += 1;
+        }
+        if ri == right_count {
+            return false;
+        }
+        if run_bounds(right, ri).0 > ls {
+            return false;
+        }
+    }
+    true
+}
+
+fn array_intersects_array(left: &[u8], right: &[u8]) -> bool {
+    let mut li = 0;
+    let mut ri = 0;
+    let left_len = left.len() / 2;
+    let right_len = right.len() / 2;
+    while li < left_len && ri < right_len {
+        match read_u16_at(left, li * 2).cmp(&read_u16_at(right, ri * 2)) {
+            Ordering::Less => li += 1,
+            Ordering::Greater => ri += 1,
+            Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+fn array_intersects_bitmap(array: &[u8], bitmap: &[u8]) -> bool {
+    let len = array.len() / 2;
+    for index in 0..len {
+        if bitmap_contains(bitmap, read_u16_at(array, index * 2)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn array_intersects_run(array: &[u8], run: &[u8], runs: u16) -> bool {
+    let len = array.len() / 2;
+    let run_count = usize::from(runs);
+    let mut run_index = 0usize;
+    for index in 0..len {
+        let value = read_u16_at(array, index * 2);
+        while run_index < run_count {
+            let (start, end) = run_bounds(run, run_index);
+            if value < start {
+                break;
+            }
+            if value <= end {
+                return true;
+            }
+            run_index += 1;
+        }
+        if run_index == run_count {
+            return false;
+        }
+    }
+    false
+}
+
+fn bitmap_intersects_bitmap(left: &[u8], right: &[u8]) -> bool {
+    left[..BITMAP_BYTES].chunks_exact(8).zip(right[..BITMAP_BYTES].chunks_exact(8)).any(|(l, r)| {
+        let l = u64::from_le_bytes(l.try_into().unwrap());
+        let r = u64::from_le_bytes(r.try_into().unwrap());
+        l & r != 0
+    })
+}
+
+fn bitmap_intersects_run(bitmap: &[u8], run: &[u8], runs: u16) -> bool {
+    let run_count = usize::from(runs);
+    for run_index in 0..run_count {
+        let (start, end) = run_bounds(run, run_index);
+        if bitmap_intersects_range(bitmap, start, end) {
+            return true;
+        }
+    }
+    false
+}
+
+fn run_intersects_run(left: &[u8], left_runs: u16, right: &[u8], right_runs: u16) -> bool {
+    let left_count = usize::from(left_runs);
+    let right_count = usize::from(right_runs);
+    let mut li = 0;
+    let mut ri = 0;
+    while li < left_count && ri < right_count {
+        let (ls, le) = run_bounds(left, li);
+        let (rs, re) = run_bounds(right, ri);
+        if le < rs {
+            li += 1;
+        } else if re < ls {
+            ri += 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+fn bitmap_contains_range(payload: &[u8], start: u16, end: u16) -> bool {
+    let start_word = usize::from(start / 64);
+    let end_word = usize::from(end / 64);
+    let start_bit = start % 64;
+    let end_bit = end % 64;
+
+    if start_word == end_word {
+        let mask = range_mask(start_bit, end_bit);
+        return read_u64_at(payload, start_word * 8) & mask == mask;
+    }
+
+    let first_mask = u64::MAX << start_bit;
+    if read_u64_at(payload, start_word * 8) & first_mask != first_mask {
+        return false;
+    }
+    if end_word > start_word + 1 {
+        let mid_start = (start_word + 1) * 8;
+        let mid_end = end_word * 8;
+        let all_full = payload[mid_start..mid_end]
+            .chunks_exact(8)
+            .all(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) == u64::MAX);
+        if !all_full {
+            return false;
+        }
+    }
+    let last_mask = if end_bit == 63 { u64::MAX } else { (1u64 << (end_bit + 1)) - 1 };
+    read_u64_at(payload, end_word * 8) & last_mask == last_mask
+}
+
+fn bitmap_intersects_range(payload: &[u8], start: u16, end: u16) -> bool {
+    let start_word = usize::from(start / 64);
+    let end_word = usize::from(end / 64);
+    let start_bit = start % 64;
+    let end_bit = end % 64;
+
+    if start_word == end_word {
+        let mask = range_mask(start_bit, end_bit);
+        return read_u64_at(payload, start_word * 8) & mask != 0;
+    }
+
+    let first_mask = u64::MAX << start_bit;
+    if read_u64_at(payload, start_word * 8) & first_mask != 0 {
+        return true;
+    }
+    if end_word > start_word + 1 {
+        let mid_start = (start_word + 1) * 8;
+        let mid_end = end_word * 8;
+        let any_nonzero = payload[mid_start..mid_end]
+            .chunks_exact(8)
+            .any(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) != 0);
+        if any_nonzero {
+            return true;
+        }
+    }
+    let last_mask = if end_bit == 63 { u64::MAX } else { (1u64 << (end_bit + 1)) - 1 };
+    read_u64_at(payload, end_word * 8) & last_mask != 0
+}
+
 fn run_bounds(payload: &[u8], index: usize) -> (u16, u16) {
     let offset = RUN_NUM_BYTES + index * RUN_ELEMENT_BYTES;
     let start = read_u16_at(payload, offset);
@@ -1018,6 +1513,18 @@ mod test {
         assert_eq!(left_view.xor_len(&right_view), (left ^ right).len());
     }
 
+    fn assert_predicate_ops(left: &RoaringBitmap, right: &RoaringBitmap) {
+        let left_bytes = view_bytes(left);
+        let right_bytes = view_bytes(right);
+        let left_view = RoaringBitmapView::try_new(&left_bytes).unwrap();
+        let right_view = RoaringBitmapView::try_new(&right_bytes).unwrap();
+
+        assert_eq!(left_view.is_subset(&right_view), left.is_subset(right));
+        assert_eq!(right_view.is_subset(&left_view), right.is_subset(left));
+        assert_eq!(left_view.intersects(&right_view), !left.is_disjoint(right));
+        assert_eq!(right_view.intersects(&left_view), !right.is_disjoint(left));
+    }
+
     #[test]
     fn reads_array_bitmap_and_run_containers() {
         let mut bitmap = RoaringBitmap::from_iter([1, 3, 7, 65_535, 70_000]);
@@ -1068,6 +1575,7 @@ mod test {
             (&run, &disjoint_key),
         ] {
             assert_cardinality_ops(left, right);
+            assert_predicate_ops(left, right);
         }
     }
 
@@ -1129,6 +1637,11 @@ mod test {
                 bitmap.symmetric_difference_len(&other)
             );
             prop_assert_eq!(view.xor_len(&other_view), bitmap.symmetric_difference_len(&other));
+
+            prop_assert_eq!(view.is_subset(&other_view), bitmap.is_subset(&other));
+            prop_assert_eq!(other_view.is_subset(&view), other.is_subset(&bitmap));
+            prop_assert_eq!(view.intersects(&other_view), !bitmap.is_disjoint(&other));
+            prop_assert_eq!(other_view.intersects(&view), !other.is_disjoint(&bitmap));
         }
     }
 }
